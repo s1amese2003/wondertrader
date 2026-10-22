@@ -107,8 +107,13 @@ int main(int argc, char* argv[])
 		const char* stra_id = cfg->get("sel")->get("strategy")->getCString("id");
 		replayer.register_sink(mocker, stra_id);
 
-		replayer.register_task(mocker->id(), cfg->get("sel")->get("task")->getUInt32("date"),
-			cfg->get("sel")->get("task")->getUInt32("time"), cfg->get("sel")->get("task")->getCString("period"));
+		WTSVariant* task = cfg->get("sel")->get("task");
+		const char* trdtpl = task->getCString("trdtpl");
+		const char* session = task->getCString("session");
+		replayer.register_task(mocker->id(), task->getUInt32("date"),
+			task->getUInt32("time"), task->getCString("period"),
+			strlen(trdtpl) > 0 ? trdtpl : "CHINA",
+			strlen(session) > 0 ? session : "TRADING");
 	}
 	else if (strcmp(mode, "exec") == 0)
 	{
