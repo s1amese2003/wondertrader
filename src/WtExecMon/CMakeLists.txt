@@ -32,7 +32,7 @@ ELSE (GNUCC)
 		boost_filesystem
 		boost_thread)
 	if(WIN32)
-		LIST(APPEND LIBS iconv)
+		LIST(APPEND LIBS ws2_32 iconv)
 	ENDIF()
 ENDIF()
 

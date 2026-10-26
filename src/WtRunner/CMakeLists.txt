@@ -51,6 +51,8 @@ file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/parsers/)
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/traders/)
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/executer/)
 
+ADD_DEPENDENCIES(WtRunner ParserUDP TraderCTP TraderCTPMini TraderCTPOpt TraderFemas TraderMocker TraderXTP WtDataStorage WtDataStorageAD WtExeFact WtMsgQue WtRiskMonFact)
+
 add_custom_command(TARGET WtRunner POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserUDP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/

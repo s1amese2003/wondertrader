@@ -48,6 +48,8 @@ ELSE (GNUCC)
 ENDIF ()
 
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/parsers/)
+ADD_DEPENDENCIES(QuoteFactory ParserCTP ParserCTPMini ParserFemas ParserXTP WtDataStorage)
+
 add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/

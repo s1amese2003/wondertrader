@@ -24,6 +24,7 @@ ELSE(GNUCC)
 		SET(LIBS
 			boost_thread
             boost_filesystem
+			ws2_32
 		)
 	ELSE(UNIX)
 		SET(LIBS

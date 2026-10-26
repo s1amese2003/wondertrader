@@ -7,6 +7,8 @@
  * 
  * \brief 
  */
+//SignalHook.hpp会引入windows.h，必须在WTSDataDef.hpp的using namespace std之前，否则byte和std::byte冲突
+#include "../WTSUtils/SignalHook.hpp"
 #include "WtDtRunner.h"
 
 #include "../WtDtCore/WtHelper.h"
@@ -15,7 +17,6 @@
 #include "../Includes/WTSDataDef.hpp"
 #include "../Includes/WTSContractInfo.hpp"
 
-#include "../WTSUtils/SignalHook.hpp"
 #include "../WTSUtils/WTSCfgLoader.h"
 #include "../WTSTools/WTSLogger.h"
 

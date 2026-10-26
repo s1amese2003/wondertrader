@@ -49,6 +49,8 @@ ELSE (GNUCC)
 ENDIF ()
 
 file(MAKE_DIRECTORY ${LIBRARY_OUTPUT_PATH}/parsers/)
+ADD_DEPENDENCIES(WtDtPorter ParserCTP ParserCTPMini ParserFemas ParserXTP WtDataStorage WtDataStorageAD)
+
 add_custom_command(TARGET WtDtPorter POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E
 		copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTP${SUFFIX} ${LIBRARY_OUTPUT_PATH}/parsers/
