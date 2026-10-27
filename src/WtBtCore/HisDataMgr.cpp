@@ -18,6 +18,17 @@ bool HisDataMgr::init(WTSVariant* cfg)
 		module = WtHelper::getInstDir() + DLLHelper::wrap_module(module.c_str());
 
 	DllHandle libParser = DLLHelper::load_library(module.c_str());
+#if defined(_WIN32) && !defined(_MSC_VER)
+	//MinGW编译出来的模块带lib前缀，而wrap_module在windows下不加前缀，这里加上前缀再尝试一次
+	if (libParser == NULL)
+	{
+		std::size_t pos = module.find_last_of("/\\");
+		std::string libModule = (pos == std::string::npos) ? ("lib" + module) : (module.substr(0, pos + 1) + "lib" + module.substr(pos + 1));
+		libParser = DLLHelper::load_library(libModule.c_str());
+		if (libParser)
+			module = libModule;
+	}
+#endif
 	if (libParser)
 	{
 		FuncCreateBtDtReader pFuncCreator = (FuncCreateBtDtReader)DLLHelper::get_symbol(libParser, "createBtDtReader");
@@ -37,6 +48,12 @@ bool HisDataMgr::init(WTSVariant* cfg)
 	{
 		WTSLogger::error("Loading module back data storage module {} failed", module);
 
+	}
+
+	if (_reader == NULL)
+	{
+		WTSLogger::error("Backtest data reader not created, back data from {} unavailable", module);
+		return false;
 	}
 
 	_reader->init(cfg, this);
