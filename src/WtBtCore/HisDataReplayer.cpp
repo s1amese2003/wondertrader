@@ -441,6 +441,8 @@ void HisDataReplayer::clear_cache()
 	_bars_cache.clear();
 	_unbars_cache.clear();
 	_unsubbed_in_need.clear();
+	_codes_in_subbed.clear();
+	_codes_in_unsubbed.clear();
 
 	_main_key = "";
 	_main_period = "";
@@ -490,6 +492,11 @@ void HisDataReplayer::reset()
 	}
 
 	_unbars_cache.clear();
+	//未订阅K线缓存已清空，对应的标记也要一起清掉，否则再次回放时checkUnbars不会重新加载
+	//这些标记都会在handle_init里重新订阅时生成
+	_unsubbed_in_need.clear();
+	_codes_in_subbed.clear();
+	_codes_in_unsubbed.clear();
 
 	_day_cache.clear();
 	_ticker_keys.clear();
@@ -502,6 +509,7 @@ void HisDataReplayer::reset()
 	_price_map.clear();
 
 	_main_key = "";
+	_main_period = "";
 	_min_period = "";
 
 	_cur_date = 0;
@@ -770,8 +778,19 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 {
 	TimeUtils::Ticker ticker;
 
-	BarsListPtr barsList = _bars_cache[_main_key];
-	WTSSessionInfo* sInfo = get_session_info(barsList->_code.c_str(), true);
+	//主K线加载失败时_main_key已经设置了，但是缓存里没有数据，不能直接用[]取
+	auto mit = _bars_cache.find(_main_key);
+	BarsListPtr barsList = (mit != _bars_cache.end()) ? mit->second : BarsListPtr();
+	WTSSessionInfo* sInfo = barsList ? get_session_info(barsList->_code.c_str(), true) : NULL;
+	if (sInfo == NULL)
+	{
+		WTSLogger::error("Main K bars {} not loaded or session not found, replaying canceled", _main_key);
+		_listener->handle_replay_done();
+		if (_notifier)
+			_notifier->notifyEvent("BT_END");
+		return;
+	}
+
 	CodeHelper::CodeInfo codeInfo = CodeHelper::extractStdCode(barsList->_code.c_str(), NULL);
 	std::string commId = codeInfo.stdCommID();
 
@@ -1101,7 +1120,10 @@ void HisDataReplayer::run_by_tasks(bool bNeedDump /* = false */)
 			//如果一开始不能整除,则直接修正一下
 			if (mins % _task->_time != 0 && mins < sInfo->getTradingMins())
 			{
-				mins = mins / _task->_time + _task->_time;
+				//向上对齐到下一个整周期，超过收盘则按收盘处理
+				mins = (mins / _task->_time + 1) * _task->_time;
+				if (mins > sInfo->getTradingMins())
+					mins = sInfo->getTradingMins();
 				_cur_time = sInfo->minuteToTime(mins);
 			}
 
@@ -1567,7 +1589,8 @@ uint64_t HisDataReplayer::getNextTickTime(uint32_t curTDate, uint64_t stime /* =
 			}
 		}
 
-		if (tickList._cursor >= tickList._count)
+		//游标是从1开始的，等于_count时最后一笔还没有回放
+		if (tickList._cursor > tickList._count)
 			continue;
 
 		uint32_t nextActionTime = tickList._items[tickList._cursor - 1].action_time;
@@ -1586,10 +1609,18 @@ uint64_t HisDataReplayer::getNextTickTime(uint32_t curTDate, uint64_t stime /* =
 		if(sInfo->offsetTime(nextMinTime, false) > sInfo->getCloseTime(true))
 			continue;
 
-		while (!sInfo->isInTradingTime(nextMinTime) && tickList._cursor>tickList._items.size())
+		while (!sInfo->isInTradingTime(nextMinTime) && tickList._cursor < tickList._count)
 		{
 			tickList._cursor++;
 			nextActionTime = tickList._items[tickList._cursor - 1].action_time;
+			nextMinTime = nextActionTime / 100000;
+		}
+
+		//剩下的tick都不在交易时间，当天不再回放
+		if (!sInfo->isInTradingTime(nextMinTime))
+		{
+			tickList._cursor = tickList._count + 1;
+			continue;
 		}
 
 		const WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
@@ -1637,7 +1668,7 @@ uint64_t HisDataReplayer::getNextTransTime(uint32_t curTDate, uint64_t stime /* 
 			}
 		}
 
-		if (itemList._cursor >= itemList._count)
+		if (itemList._cursor > itemList._count)
 			continue;
 
 		const auto& nextItem = itemList._items[itemList._cursor - 1];
@@ -1685,7 +1716,7 @@ uint64_t HisDataReplayer::getNextOrdDtlTime(uint32_t curTDate, uint64_t stime /*
 			}
 		}
 
-		if (itemList._cursor >= itemList._count)
+		if (itemList._cursor > itemList._count)
 			continue;
 
 		const auto& nextItem = itemList._items[itemList._cursor - 1];
@@ -1733,7 +1764,7 @@ uint64_t HisDataReplayer::getNextOrdQueTime(uint32_t curTDate, uint64_t stime /*
 			}
 		}
 
-		if (itemList._cursor >= itemList._count)
+		if (itemList._cursor > itemList._count)
 			continue;
 
 		const auto& nextItem = itemList._items[itemList._cursor - 1];
@@ -1883,11 +1914,20 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 {	
 	WTSLogger::log_raw(LL_DEBUG, "replaying hft data...");
+	//这根K线有没有回放过真实tick
+	bool bReplayed = false;
 	for (;;)
 	{
 		uint64_t nextTime = min(UINT64_MAX, getNextTickTime(_cur_tdate, stime));
 		if (nextTime == UINT64_MAX)
-			return false;
+		{
+			/*
+			 *	当天的tick已经回放完，或者当天没有可回放的tick
+			 *	这根K线已经回放过真实tick就不再模拟，否则会同时收到真实tick和模拟tick
+			 *	没有回放过就返回false，让外层模拟tick
+			 */
+			return bReplayed;
+		}
 
 		nextTime = min(nextTime, getNextOrdDtlTime(_cur_tdate, stime));
 		nextTime = min(nextTime, getNextOrdQueTime(_cur_tdate, stime));
@@ -1926,7 +1966,7 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 		{
 			const char* stdCode = v.first.c_str();
 			auto& itemList = _trans_cache[stdCode];
-			if (itemList._cursor = itemList._count)
+			if (itemList._cursor > itemList._count)
 				continue;
 
 			auto& nextItem = itemList._items[itemList._cursor - 1];
@@ -1961,6 +2001,7 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 				newData->release();
 
 				itemList._cursor++;
+				bReplayed = true;
 			}
 		}
 
@@ -2269,11 +2310,13 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 		}
 	}
 
-	BarsListPtr& kBlkPair = _bars_cache[key];
-	if(kBlkPair == NULL)
+	//用find避免往缓存里插入空指针，reset和onMinuteEnd遍历缓存时会解引用
+	auto bit = _bars_cache.find(key);
+	if(bit == _bars_cache.end() || bit->second == NULL)
 	{
 		return NULL;
 	}
+	BarsListPtr& kBlkPair = bit->second;
 
 	_codes_in_subbed.insert(stdCode);
 
@@ -2356,9 +2399,10 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 	else
 	{
 		uint32_t curMin = (_cur_date - 19900000) * 10000 + _cur_time;
+		//数据开始时间晚于当前时间时游标会退到0，此时还没有可用的K线，不能再访问_bars[_cursor-1]
 		if (isDay)
 		{
-			if (kBlkPair->_cursor <= kBlkPair->_count)
+			if (kBlkPair->_cursor > 0 && kBlkPair->_cursor <= kBlkPair->_count)
 			{
 				if(!isClosed)
 				{
@@ -2382,7 +2426,7 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 		}
 		else
 		{
-			if (kBlkPair->_cursor <= kBlkPair->_count)
+			if (kBlkPair->_cursor > 0 && kBlkPair->_cursor <= kBlkPair->_count)
 			{
 				while (kBlkPair->_bars[kBlkPair->_cursor-1].time < curMin && kBlkPair->_cursor < kBlkPair->_count)
 				{
@@ -2494,6 +2538,10 @@ WTSOrdDtlSlice* HisDataReplayer::get_order_detail_slice(const char* stdCode, uin
 	if (dataList._cursor == 0)
 		return NULL;
 
+	//当天没有数据时_items可能还留着前一天的内容，不能取
+	if (dataList._count == 0)
+		return NULL;
+
 	if (dataList._cursor == UINT_MAX)
 	{
 		uint32_t uDate = _cur_date;
@@ -2520,7 +2568,8 @@ WTSOrdDtlSlice* HisDataReplayer::get_order_detail_slice(const char* stdCode, uin
 		dataList._cursor = idx + 1;
 	}
 
-	uint32_t eIdx = dataList._cursor - 1;
+	//当天的数据回放完以后游标是_count+1，要限制在最后一条
+	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor, dataList._count) - 1);
 	uint32_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -2540,6 +2589,10 @@ WTSOrdQueSlice* HisDataReplayer::get_order_queue_slice(const char* stdCode, uint
 
 	auto& dataList = _ordque_cache[stdCode];
 	if (dataList._cursor == 0)
+		return NULL;
+
+	//当天没有数据时_items可能还留着前一天的内容，不能取
+	if (dataList._count == 0)
 		return NULL;
 
 	if (dataList._cursor == UINT_MAX)
@@ -2568,7 +2621,8 @@ WTSOrdQueSlice* HisDataReplayer::get_order_queue_slice(const char* stdCode, uint
 		dataList._cursor = idx + 1;
 	}
 
-	uint32_t eIdx = dataList._cursor - 1;
+	//当天的数据回放完以后游标是_count+1，要限制在最后一条
+	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor, dataList._count) - 1);
 	uint32_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -2588,6 +2642,10 @@ WTSTransSlice* HisDataReplayer::get_transaction_slice(const char* stdCode, uint3
 
 	auto& dataList = _trans_cache[stdCode];
 	if (dataList._cursor == 0)
+		return NULL;
+
+	//当天没有数据时_items可能还留着前一天的内容，不能取
+	if (dataList._count == 0)
 		return NULL;
 
 	if (dataList._cursor == UINT_MAX)
@@ -2616,7 +2674,8 @@ WTSTransSlice* HisDataReplayer::get_transaction_slice(const char* stdCode, uint3
 		dataList._cursor = idx + 1;
 	}
 
-	std::size_t eIdx = dataList._cursor - 1;
+	//当天的数据回放完以后游标是_count+1，要限制在最后一条
+	std::size_t eIdx = (std::min)(dataList._cursor, dataList._count) - 1;
 	std::size_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -2651,6 +2710,8 @@ bool HisDataReplayer::checkOrderDetails(const char* stdCode, uint32_t uDate)
 		auto& dataList = it->second;
 		if (dataList._date != uDate)
 			bNeedCache = true;
+		else if (dataList._count == 0)	//当天已经确认没有数据，和checkTicks一致
+			return false;
 	}
 
 
@@ -2669,7 +2730,7 @@ bool HisDataReplayer::checkOrderDetails(const char* stdCode, uint32_t uDate)
 
 		if (!hasData)
 		{
-			auto& dataList = _trans_cache[stdCode];
+			auto& dataList = _orddtl_cache[stdCode];
 			dataList._items.resize(0);
 			dataList._cursor = UINT_MAX;
 			dataList._code = stdCode;
@@ -2693,6 +2754,8 @@ bool HisDataReplayer::checkOrderQueues(const char* stdCode, uint32_t uDate)
 		auto& dataList = it->second;
 		if (dataList._date != uDate)
 			bNeedCache = true;
+		else if (dataList._count == 0)	//当天已经确认没有数据，和checkTicks一致
+			return false;
 	}
 
 
@@ -2711,7 +2774,7 @@ bool HisDataReplayer::checkOrderQueues(const char* stdCode, uint32_t uDate)
 
 		if (!hasData)
 		{
-			auto& dataList = _trans_cache[stdCode];
+			auto& dataList = _ordque_cache[stdCode];
 			dataList._items.resize(0);
 			dataList._cursor = UINT_MAX;
 			dataList._code = stdCode;
@@ -2735,6 +2798,8 @@ bool HisDataReplayer::checkTransactions(const char* stdCode, uint32_t uDate)
 		auto& dataList = it->second;
 		if (dataList._date != uDate)
 			bNeedCache = true;
+		else if (dataList._count == 0)	//当天已经确认没有数据，和checkTicks一致
+			return false;
 	}
 
 
@@ -2847,8 +2912,10 @@ WTSTickData* HisDataReplayer::get_last_tick(const char* stdCode)
 		std::size_t idx = tit - tickList._items.begin();
 		tickList._cursor = idx + 1;
 	}
-	else if (tickList._cursor > tickList._count)
-		return NULL;
+
+	//当天的tick都已经回放完(包括上面定位到最后一笔之后)，返回当天最后一笔
+	if (tickList._cursor > tickList._count)
+		return (tickList._count > 0) ? WTSTickData::create(tickList._items[tickList._count - 1]) : NULL;
 
 	return WTSTickData::create(tickList._items[tickList._cursor - 1]);
 }
@@ -3107,6 +3174,10 @@ void HisDataReplayer::sub_transaction(uint32_t sid, const char* stdCode)
 
 void HisDataReplayer::checkUnbars()
 {
+	//没有主K线周期就不知道该加载什么周期的K线，下面解析_main_period也会越界
+	if (_main_period.empty())
+		return;
+
 	for(const std::string& stdCode : _unsubbed_in_need)
 	{
 		//先检查是否已经在未订阅K线中
@@ -3733,6 +3804,11 @@ bool HisDataReplayer::cacheRawBarsFromCSV(const std::string& key, const char* st
 		//转储的数据不做检查，直接重新生成即可
 		proc_block_data(filename.c_str(), content, true, false);
 		uint32_t barcnt = content.size() / sizeof(WTSBarStruct);
+		if (barcnt == 0)
+		{
+			WTSLogger::error("No valid bars in data file {}", filename);
+			return false;
+		}
 
 		if (bSubbed)
 			_bars_cache[key].reset(new BarsList);
@@ -3802,6 +3878,16 @@ bool HisDataReplayer::cacheRawBarsFromCSV(const std::string& key, const char* st
 			}
 		}
 		barsList->_count = barsList->_bars.size();
+
+		if (barsList->_count == 0)
+		{
+			WTSLogger::error("No valid bars in data file {}", csvfile);
+			if (bSubbed)
+				_bars_cache.erase(key);
+			else
+				_unbars_cache.erase(key);
+			return false;
+		}
 
 		uint64_t stime = isDay ? barsList->_bars[0].date : barsList->_bars[0].time;
 		uint64_t etime = isDay ? barsList->_bars[barsList->_count - 1].date : barsList->_bars[barsList->_count - 1].time;
