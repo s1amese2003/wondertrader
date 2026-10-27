@@ -162,6 +162,8 @@ HisDataReplayer::HisDataReplayer()
 	, _tick_ctx_tdate(0)
 	, _tick_sub_ver(1)
 	, _tick_ctx_ver(0)
+	, _tick_build_seq(1)
+	, _bar_seq(0)
 {
 }
 
@@ -879,8 +881,9 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 			if (_tick_enabled)
 			{
 				//如果开启了tick回放,则直接回放tick数据
-				//如果tick回放失败，说明tick数据不存在，则需要模拟tick
-				_tick_simulated = !replayHftDatas(curBarTime, nextBarTime);
+				//没有真实tick的代码，后面的simTicks里会按代码单独判断，用K线模拟tick
+				//小节的最后一根K线，小节最后一分钟里的tick(如15:00:00的收盘tick)也在这根K线里回放
+				replayHftDatas(curBarTime, nextBarTime, sInfo->isLastOfSection(nextTime));
 			}
 
 			if (!_tick_enabled)
@@ -888,9 +891,20 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 				checkUnbars();
 			}
 
+			//回放时钟停在这根K线最后一个事件的时间，下面切到K线结束的时间
+			uint64_t lastEvtTime = (uint64_t)_cur_date * 1000000000 + (uint64_t)_cur_time * 100000 + _cur_secs;
+
 			_cur_date = nextDate;
 			_cur_time = nextTime;
 			_cur_secs = 0;
+
+			/*
+			 *	小节最后一根K线会回放小节最后一分钟里的tick，比如11:30:00.500
+			 *	这时候K线结束时间11:30:00.000比已经回放的tick还早，时钟不能往回退，秒数保留到最后一笔tick
+			 *	后面模拟的tick也用这个时间，其他K线的最后一个事件都早于结束时间，秒数还是0
+			 */
+			if (lastEvtTime > (uint64_t)_cur_date * 1000000000 + (uint64_t)_cur_time * 100000)
+				_cur_secs = (uint32_t)(lastEvtTime % 100000);
 
 			bool isEndTDate = (sInfo->offsetTime(_cur_time, false) >= sInfo->getCloseTime(true));
 
@@ -905,8 +919,8 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 			 */
 			for(int i = 0; i < 4; i++)
 			{
-				if (_tick_simulated)
-					simTicks(nextDate, nextTime, (isDay || isEndTDate) ? nextTDate : 0, i);
+				//开启了tick回放时，simTicks只给这根K线里没有真实tick、当天也没有后续tick的代码模拟
+				simTicks(nextDate, nextTime, (isDay || isEndTDate) ? nextTDate : 0, i);
 
 				if (!_tick_enabled)
 					simTickWithUnsubBars(curBarTime, nextBarTime, (isDay || isEndTDate) ? nextTDate : 0, i);
@@ -1250,6 +1264,39 @@ void HisDataReplayer::run_by_tasks(bool bNeedDump /* = false */)
 	}
 }
 
+bool HisDataReplayer::needSimTick(BarsList* barsList)
+{
+	//没开tick回放的全部用K线模拟
+	if (!_tick_enabled)
+		return true;
+
+	//这根K线对应的tick订阅上下文按重建序号缓存，复权代码对应的是去掉复权后缀的代码
+	if (barsList->_tick_ctx_seq != _tick_build_seq)
+	{
+		const std::string& code = barsList->_code;
+		std::size_t len = code.size();
+		bool bExright = (len > 0 && (code[len - 1] == SUFFIX_QFQ || code[len - 1] == SUFFIX_HFQ));
+		auto it = _tick_ctx_idx.find(bExright ? code.substr(0, len - 1) : code);
+		barsList->_tick_ctx_pos = (it == _tick_ctx_idx.end()) ? -1 : (int32_t)it->second;
+		barsList->_tick_ctx_seq = _tick_build_seq;
+	}
+
+	//没有订阅tick，或者当天没有tick数据，用K线模拟
+	if (barsList->_tick_ctx_pos < 0 || barsList->_tick_ctx_pos >= (int32_t)_tick_ctxs.size())
+		return true;
+
+	const TickSubCtx& ctx = _tick_ctxs[barsList->_tick_ctx_pos];
+	if (ctx._list == NULL)
+		return true;
+
+	//这根K线里回放过真实tick，不再模拟，否则会同时收到真实tick和模拟tick
+	if (_bar_seq != 0 && ctx._replay_seq == _bar_seq)
+		return false;
+
+	//当天还有后续的tick，说明这段时间本来就没有成交，不模拟；当天的tick已经回放完了才用K线模拟
+	return ctx._parked || ctx._next == UINT64_MAX;
+}
+
 void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate /* = 0 */, int pxType /* = 0 */)
 {
 	//这里应该触发检查
@@ -1258,6 +1305,13 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 	for (auto it = _bars_cache.begin(); it != _bars_cache.end(); it++)
 	{
 		BarsListPtr& barsList = (BarsListPtr&)it->second;
+		/*
+		 *	开启tick回放时按代码判断要不要模拟，有真实tick的代码整个跳过，和原来不调用simTicks一样
+		 *	原来只要有一个代码有真实tick，其他没有tick数据的代码这根K线也收不到模拟tick
+		 */
+		if (!needSimTick(barsList.get()))
+			continue;
+
 		if (barsList->_period != KP_DAY)
 		{
 			if (barsList->_bars.size() > barsList->_cursor)
@@ -1282,7 +1336,8 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 							WTSTickStruct& curTS = _day_cache[barsList->_code];
 							strcpy(curTS.code, barsList->_code.c_str());
 							curTS.action_date = _cur_date;
-							curTS.action_time = _cur_time * 100000;
+							//秒数一般是0，只有小节最后一根K线里回放过最后一分钟的tick时才不是0，保证时间不往回退
+							curTS.action_time = _cur_time * 100000 + _cur_secs;
 
 							double newPx = 0.0;
 							if (pxType == 0)
@@ -1308,6 +1363,8 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 								curTS.low = min(curTS.price, curTS.low);
 
 							update_price(barsList->_code.c_str(), curTS.price);
+							//这一笔是用K线模拟的tick
+							_tick_simulated = true;
 							WTSTickData* curTick = WTSTickData::create(curTS);
 							_listener->handle_tick(barsList->_code.c_str(), curTick, pxType);
 							curTick->release();
@@ -1372,6 +1429,7 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 							curTS.price = newPx;
 							curTS.volume = nextBar.vol;
 							update_price(barsList->_code.c_str(), curTS.price);
+							_tick_simulated = true;
 							WTSTickData* curTick = WTSTickData::create(curTS);
 							_listener->handle_tick(realCode.c_str(), curTick, pxType);
 							curTick->release();
@@ -1450,6 +1508,7 @@ void HisDataReplayer::simTickWithUnsubBars(uint64_t stime, uint64_t nowTime, uin
 							curTS.low = min(curTS.price, curTS.low);
 
 
+						_tick_simulated = true;
 						WTSTickData* curTick = WTSTickData::create(curTS);
 						_listener->handle_tick(barsList->_code.c_str(), curTick, pxType);
 						curTick->release();
@@ -1571,17 +1630,31 @@ void HisDataReplayer::invalidateTickCtxs()
 	_tick_parked.clear();
 	_tick_dirty.clear();
 	_tick_due.clear();
+	_tick_ctx_idx.clear();
 	_tick_ctx_tdate = 0;
 	_tick_sub_ver++;
+	_tick_build_seq++;
 }
 
 void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
 {
+	/*
+	 *	同一个交易日里因为新订阅了代码而重建，就是盘中新订阅
+	 *	订阅表在一个交易日里只会追加，前oldCnt个上下文和原来的一一对应，后面的是新订阅的代码
+	 *	这根K线里回放过真实tick的标记要保留下来，模拟tick的时候要用
+	 */
+	const bool bMidDay = (_tick_ctx_tdate == curTDate);
+	const std::size_t oldCnt = bMidDay ? _tick_ctxs.size() : 0;
+	std::vector<uint64_t> oldSeqs;
+	for (std::size_t idx = 0; idx < oldCnt; idx++)
+		oldSeqs.emplace_back(_tick_ctxs[idx]._replay_seq);
+
 	_tick_ctxs.clear();
 	_tick_heap.clear();
 	_tick_parked.clear();
 	_tick_dirty.clear();
 	_tick_due.clear();
+	_tick_ctx_idx.clear();
 
 	//顺序和订阅表的遍历顺序一致，同一时间有多个订阅要回放时按这个顺序回放，和原来逐个遍历订阅表的顺序相同
 	_tick_ctxs.reserve(_tick_sub_map.size());
@@ -1592,6 +1665,8 @@ void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
 		ctx._list = NULL;
 		ctx._sinfo = NULL;
 		ctx._next = UINT64_MAX;
+		ctx._parked = false;
+		ctx._replay_seq = (_tick_ctxs.size() < oldSeqs.size()) ? oldSeqs[_tick_ctxs.size()] : 0;
 		if (checkTicks(ctx._code.c_str(), curTDate))
 		{
 			ctx._sinfo = get_session_info(ctx._code.c_str(), true);
@@ -1600,7 +1675,35 @@ void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
 			else
 				ctx._list = &_ticks_cache[ctx._code];
 		}
+		_tick_ctx_idx[ctx._code] = (uint32_t)_tick_ctxs.size();
 		_tick_ctxs.emplace_back(ctx);
+	}
+
+	/*
+	 *	盘中新订阅的代码，游标定位到当前回放的时间，更早的tick都已经过去了，不再回放
+	 *	原来会定位到当天的第一笔，从开盘重新回放，回放的时间会倒退
+	 *	之前用get_last_tick之类的接口查过的代码游标已经定位过，但是位置是查询时的，也要重新定位
+	 */
+	if (bMidDay)
+	{
+		WTSTickStruct curTick;
+		curTick.action_date = _cur_date;
+		curTick.action_time = _cur_time * 100000 + _cur_secs;
+		for (std::size_t idx = oldCnt; idx < _tick_ctxs.size(); idx++)
+		{
+			TickSubCtx& ctx = _tick_ctxs[idx];
+			if (ctx._list == NULL)
+				continue;
+
+			HftDataList<WTSTickStruct>& tickList = *ctx._list;
+			auto tit = std::lower_bound(tickList._items.begin(), tickList._items.end(), curTick, [](const WTSTickStruct& a, const WTSTickStruct& b) {
+				if (a.action_date != b.action_date)
+					return a.action_date < b.action_date;
+				else
+					return a.action_time < b.action_time;
+			});
+			tickList._cursor = (tit - tickList._items.begin()) + 1;
+		}
 	}
 
 	for (uint32_t idx = 0; idx < (uint32_t)_tick_ctxs.size(); idx++)
@@ -1608,12 +1711,14 @@ void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
 
 	_tick_ctx_tdate = curTDate;
 	_tick_ctx_ver = _tick_sub_ver;
+	_tick_build_seq++;
 }
 
 void HisDataReplayer::scheduleTick(uint32_t idx, uint64_t stime)
 {
 	TickSubCtx& ctx = _tick_ctxs[idx];
 	ctx._next = UINT64_MAX;
+	ctx._parked = false;
 	if (ctx._list == NULL)
 		return;
 
@@ -1683,6 +1788,7 @@ void HisDataReplayer::scheduleTick(uint32_t idx, uint64_t stime)
 	{
 		const WTSTickStruct& parkedTick = tickList._items[tickList._cursor - 1];
 		ctx._next = (uint64_t)parkedTick.action_date * 1000000000 + parkedTick.action_time;
+		ctx._parked = true;
 		_tick_parked.emplace_back(idx);
 		return;
 	}
@@ -1739,43 +1845,6 @@ void HisDataReplayer::collectDueTicks(uint64_t nextTime)
 
 		if (bAdded)
 			std::sort(_tick_due.begin(), _tick_due.end());
-	}
-}
-
-void HisDataReplayer::replayNewSubTicks(std::size_t fromPos, std::size_t toPos, uint64_t nextTime, bool bCursorFirst, uint64_t& total, bool& bReplayed)
-{
-	for (std::size_t pos = fromPos; pos < toPos && pos < _tick_sub_map.size(); pos++)
-	{
-		//回调里可能又订阅了新代码，订阅表的存储会重新分配，每次都重新取
-		std::string stdCode = (_tick_sub_map.begin() + pos)->first;
-		auto it = _ticks_cache.find(stdCode);
-		if (it == _ticks_cache.end())
-			continue;
-
-		HftDataList<WTSTickStruct>& tickList = it->second;
-		if ((bCursorFirst && tickList._items.empty()) || tickList._cursor > tickList._count)
-			continue;
-
-		WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
-		uint64_t lastTime = (uint64_t)nextTick.action_date * 1000000000 + nextTick.action_time;
-		if (lastTime > nextTime)
-			continue;
-
-		if (bCursorFirst)
-			tickList._cursor++;
-
-		update_price(stdCode.c_str(), nextTick.price);
-		WTSTickData* newTick = WTSTickData::create(nextTick);
-		newTick->setCode(stdCode.c_str());
-		_listener->handle_tick(stdCode.c_str(), newTick, 0);
-		newTick->release();
-
-		if (!bCursorFirst)
-		{
-			tickList._cursor++;
-			bReplayed = true;
-		}
-		total++;
 	}
 }
 
@@ -2002,8 +2071,6 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 		//3、第三步再回放tick数据
 		//只回放时间到了的订阅，顺序和原来遍历订阅表的顺序一致
 		collectDueTicks(nextTime);
-		std::size_t ctxCnt = _tick_ctxs.size();
-		std::size_t subCnt = _tick_sub_map.size();
 		//按下标遍历，回调里清空缓存时_tick_due也会被清空，不会访问失效的元素
 		for (std::size_t k = 0; k < _tick_due.size(); k++)
 		{
@@ -2021,6 +2088,8 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 			tickList._cursor++;
 
 			update_price(stdCode, nextTick.price);
+			//这一笔是真实tick
+			_tick_simulated = false;
 			WTSTickData* newTick = WTSTickData::create(nextTick);
 			newTick->setCode(stdCode);
 			_listener->handle_tick(stdCode, newTick, 0);
@@ -2029,12 +2098,8 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 			total_ticks++;
 		}
 		//回放过的订阅游标变了，下一次取时间之前重新计算
+		//回调里新订阅的代码在下一次取时间时重建上下文，从当前时间开始回放
 		_tick_dirty.insert(_tick_dirty.end(), _tick_due.begin(), _tick_due.end());
-		if (_tick_ctx_ver != _tick_sub_ver && subCnt > ctxCnt)
-		{
-			bool bDummy = false;
-			replayNewSubTicks(ctxCnt, subCnt, nextTime, true, total_ticks, bDummy);
-		}
 
 		//4、最后回放委托队列
 		for (auto& v : _ordque_sub_map)
@@ -2066,11 +2131,13 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 	return total_ticks;
 }
 
-bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
-{	
+bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime, bool bSecEnd /* = false */)
+{
 	WTSLogger::log_raw(LL_DEBUG, "replaying hft data...");
 	//这根K线有没有回放过真实tick
 	bool bReplayed = false;
+	//每根K线一个序号，各代码在这根K线里有没有回放过真实tick用它来判断
+	_bar_seq++;
 	for (;;)
 	{
 		uint64_t nextTime = min(UINT64_MAX, getNextTickTime(_cur_tdate, stime));
@@ -2088,7 +2155,13 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 		nextTime = min(nextTime, getNextOrdQueTime(_cur_tdate, stime));
 		nextTime = min(nextTime, getNextTransTime(_cur_tdate, stime));
 
-		if (nextTime/100000 >= etime)
+		/*
+		 *	时间戳在K线结束那一分钟里的tick算下一根K线的
+		 *	但是小节的最后一根K线后面没有本小节的K线了，小节最后一分钟里的tick(如11:30:00、15:00:00的收盘tick)
+		 *	原来会推到下一根K线，11:30的tick到13:01才回放，15:00的tick换日以后直接丢掉，这里改成算这根K线的
+		 */
+		uint64_t nextMin = nextTime / 100000;
+		if (nextMin > etime || (nextMin == etime && !bSecEnd))
 			break;
 
 		_cur_date = (uint32_t)(nextTime / 1000000000);
@@ -2107,12 +2180,13 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 			uint64_t lastTime = (uint64_t)nextItem.action_date * 1000000000 + nextItem.action_time;
 			if (lastTime <= nextTime)
 			{
+				//和按天回放一样，先移动游标再回调，回调里取到的最后一条就是当前这条
+				itemList._cursor++;
+
 				WTSOrdDtlData* newData = WTSOrdDtlData::create(nextItem);
 				newData->setCode(stdCode);
 				_listener->handle_order_detail(stdCode, newData);
 				newData->release();
-
-				itemList._cursor++;
 			}
 		}
 
@@ -2128,20 +2202,18 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 			uint64_t lastTime = (uint64_t)nextItem.action_date * 1000000000 + nextItem.action_time;
 			if (lastTime <= nextTime)
 			{
+				itemList._cursor++;
+
 				WTSTransData* newData = WTSTransData::create(nextItem);
 				newData->setCode(stdCode);
 				_listener->handle_transaction(stdCode, newData);
 				newData->release();
-
-				itemList._cursor++;
 			}
 		}
 
 		//3、第三步再回放tick数据
 		//只回放时间到了的订阅，顺序和原来遍历订阅表的顺序一致
 		collectDueTicks(nextTime);
-		std::size_t ctxCnt = _tick_ctxs.size();
-		std::size_t subCnt = _tick_sub_map.size();
 		for (std::size_t k = 0; k < _tick_due.size(); k++)
 		{
 			uint32_t idx = _tick_due[k];
@@ -2155,22 +2227,22 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 
 			const char* stdCode = ctx._code.c_str();
 			auto& nextItem = itemList._items[itemList._cursor - 1];
+			itemList._cursor++;
+			bReplayed = true;
+			//记下这根K线里回放过真实tick，这根K线就不再给这个代码模拟tick了
+			ctx._replay_seq = _bar_seq;
+
 			update_price(stdCode, nextItem.price);
+			//这一笔是真实tick
+			_tick_simulated = false;
 			WTSTickData* newData = WTSTickData::create(nextItem);
 			newData->setCode(stdCode);
 			_listener->handle_tick(stdCode, newData, 0);
 			newData->release();
-
-			itemList._cursor++;
-			bReplayed = true;
 		}
 		//回放过的订阅游标变了，下一次取时间之前重新计算
+		//回调里新订阅的代码在下一次取时间时重建上下文，从当前时间开始回放
 		_tick_dirty.insert(_tick_dirty.end(), _tick_due.begin(), _tick_due.end());
-		if (_tick_ctx_ver != _tick_sub_ver && subCnt > ctxCnt)
-		{
-			uint64_t nDummy = 0;
-			replayNewSubTicks(ctxCnt, subCnt, nextTime, false, nDummy, bReplayed);
-		}
 
 		//4、最后回放委托队列
 		for (auto& v : _ordque_sub_map)
@@ -2184,12 +2256,12 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 			uint64_t lastTime = (uint64_t)nextItem.action_date * 1000000000 + nextItem.action_time;
 			if (lastTime <= nextTime)
 			{
+				itemList._cursor++;
+
 				WTSOrdQueData* newData = WTSOrdQueData::create(nextItem);
 				newData->setCode(stdCode);
 				_listener->handle_order_queue(stdCode, newData);
 				newData->release();
-
-				itemList._cursor++;
 			}
 		}
 	}
@@ -2566,26 +2638,20 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 	else
 	{
 		uint32_t curMin = (_cur_date - 19900000) * 10000 + _cur_time;
-		//数据开始时间晚于当前时间时游标会退到0，此时还没有可用的K线，不能再访问_bars[_cursor-1]
+		/*
+		 *	游标前面的K线都是onMinuteEnd已经发过收盘回调的，游标指向的是下一根还没收盘的K线
+		 *	这里只能越过比当前时间严格早的K线，当前这根(分钟线时间等于当前分钟、日线日期等于当前交易日)
+		 *	要等onMinuteEnd收盘以后由它来移动游标，否则会提前拿到当前K线(前视)，而且这根K线的收盘回调也会丢掉
+		 *	数据开始时间晚于当前时间时游标会退到0，此时还没有可用的K线，不能再访问_bars[_cursor-1]
+		 */
 		if (isDay)
 		{
 			if (kBlkPair->_cursor > 0 && kBlkPair->_cursor <= kBlkPair->_count)
 			{
-				if(!isClosed)
+				while (kBlkPair->_cursor < kBlkPair->_count && kBlkPair->_bars[kBlkPair->_cursor].date < _cur_tdate)
 				{
-					while (kBlkPair->_bars[kBlkPair->_cursor - 1].date < _cur_tdate  && kBlkPair->_cursor < kBlkPair->_count && kBlkPair->_bars[kBlkPair->_cursor].date < _cur_tdate)
-					{
-						kBlkPair->_cursor++;
-					}
+					kBlkPair->_cursor++;
 				}
-				else
-				{
-					while (kBlkPair->_bars[kBlkPair->_cursor - 1].date <= _cur_tdate  && kBlkPair->_cursor < kBlkPair->_count && kBlkPair->_bars[kBlkPair->_cursor].date <= _cur_tdate)
-					{
-						kBlkPair->_cursor++;
-					}
-				}
-				
 
 				if (kBlkPair->_bars[kBlkPair->_cursor - 1].date > _cur_tdate)
 					kBlkPair->_cursor--;
@@ -2595,7 +2661,7 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 		{
 			if (kBlkPair->_cursor > 0 && kBlkPair->_cursor <= kBlkPair->_count)
 			{
-				while (kBlkPair->_bars[kBlkPair->_cursor-1].time < curMin && kBlkPair->_cursor < kBlkPair->_count)
+				while (kBlkPair->_cursor < kBlkPair->_count && kBlkPair->_bars[kBlkPair->_cursor].time < curMin)
 				{
 					kBlkPair->_cursor++;
 				}
@@ -2735,8 +2801,11 @@ WTSOrdDtlSlice* HisDataReplayer::get_order_detail_slice(const char* stdCode, uin
 		dataList._cursor = idx + 1;
 	}
 
-	//当天的数据回放完以后游标是_count+1，要限制在最后一条
-	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor, dataList._count) - 1);
+	//游标是下一条要回放的数据的位置+1，最后一条已经回放的是_cursor-2，原来取_cursor-1会多带一条还没回放的数据
+	//当天的数据回放完以后游标是_count+1，取到的正好是最后一条
+	if (dataList._cursor < 2)
+		return NULL;
+	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor - 1, dataList._count) - 1);
 	uint32_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -2788,8 +2857,11 @@ WTSOrdQueSlice* HisDataReplayer::get_order_queue_slice(const char* stdCode, uint
 		dataList._cursor = idx + 1;
 	}
 
-	//当天的数据回放完以后游标是_count+1，要限制在最后一条
-	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor, dataList._count) - 1);
+	//游标是下一条要回放的数据的位置+1，最后一条已经回放的是_cursor-2，原来取_cursor-1会多带一条还没回放的数据
+	//当天的数据回放完以后游标是_count+1，取到的正好是最后一条
+	if (dataList._cursor < 2)
+		return NULL;
+	uint32_t eIdx = (uint32_t)((std::min)(dataList._cursor - 1, dataList._count) - 1);
 	uint32_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -2841,8 +2913,11 @@ WTSTransSlice* HisDataReplayer::get_transaction_slice(const char* stdCode, uint3
 		dataList._cursor = idx + 1;
 	}
 
-	//当天的数据回放完以后游标是_count+1，要限制在最后一条
-	std::size_t eIdx = (std::min)(dataList._cursor, dataList._count) - 1;
+	//游标是下一条要回放的数据的位置+1，最后一条已经回放的是_cursor-2，原来取_cursor-1会多带一条还没回放的数据
+	//当天的数据回放完以后游标是_count+1，取到的正好是最后一条
+	if (dataList._cursor < 2)
+		return NULL;
+	std::size_t eIdx = (std::min)(dataList._cursor - 1, dataList._count) - 1;
 	std::size_t sIdx = 0;
 	if (eIdx >= count - 1)
 		sIdx = eIdx + 1 - count;
@@ -3080,11 +3155,16 @@ WTSTickData* HisDataReplayer::get_last_tick(const char* stdCode)
 		tickList._cursor = idx + 1;
 	}
 
-	//当天的tick都已经回放完(包括上面定位到最后一笔之后)，返回当天最后一笔
-	if (tickList._cursor > tickList._count)
-		return (tickList._count > 0) ? WTSTickData::create(tickList._items[tickList._count - 1]) : NULL;
+	/*
+	 *	游标是下一笔要回放的tick的位置+1，最后一笔已经回放的tick是_cursor-2
+	 *	原来取的是_cursor-1，也就是下一笔还没回放的tick，回测里会看到未来的行情
+	 *	当天的tick都回放完以后游标是_count+1，取到的就是当天最后一笔
+	 */
+	if (tickList._cursor < 2 || tickList._count == 0)
+		return NULL;
 
-	return WTSTickData::create(tickList._items[tickList._cursor - 1]);
+	std::size_t idx = (std::min)(tickList._cursor - 2, tickList._count - 1);
+	return WTSTickData::create(tickList._items[idx]);
 }
 
 WTSCommodityInfo* HisDataReplayer::get_commodity_info(const char* stdCode)

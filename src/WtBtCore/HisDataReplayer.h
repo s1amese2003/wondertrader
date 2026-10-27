@@ -195,6 +195,8 @@ private:
 		HftDataList<WTSTickStruct>*	_list;		//当天的tick数据，没有数据时为NULL
 		WTSSessionInfo*				_sinfo;
 		uint64_t					_next;		//下一笔要回放的tick的时间
+		bool						_parked;	//下一笔已经超过收盘时间，K线回放时不会再回放到
+		uint64_t					_replay_seq;//最后一次回放真实tick时的K线序号，用来判断这根K线里有没有真实tick
 	} TickSubCtx;
 	typedef std::pair<uint64_t, uint32_t>	TickHeapItem;	//下一笔tick的时间，上下文的序号
 
@@ -217,6 +219,10 @@ private:
 
 		uint32_t		_untouch_days;	//未用到的天数
 
+		//这根K线对应的tick订阅上下文的序号，-1表示没有订阅tick，_tick_ctx_seq和上下文的重建序号不一致时重新取
+		uint64_t		_tick_ctx_seq;
+		int32_t			_tick_ctx_pos;
+
 		inline void mark()
 		{
 			_untouch_days = 0;
@@ -227,7 +233,8 @@ private:
 			return sizeof(WTSBarStruct)*_bars.size();
 		}
 
-		_BarsList() :_cursor(UINT_MAX), _count(0), _times(1), _factor(1), _untouch_days(0){}
+		_BarsList() :_cursor(UINT_MAX), _count(0), _times(1), _factor(1), _untouch_days(0)
+			, _tick_ctx_seq(0), _tick_ctx_pos(-1){}
 	} BarsList;
 
 	/*
@@ -336,13 +343,20 @@ private:
 
 	void		loadFees(const char* filename);
 
-	bool		replayHftDatas(uint64_t stime, uint64_t etime);
+	/*
+	 *	K线回放时回放一根K线时间段里的tick
+	 *	bSecEnd为true时这根K线是小节的最后一根，小节最后一分钟里的tick(如11:30:00、15:00:00)也在这根K线里回放
+	 */
+	bool		replayHftDatas(uint64_t stime, uint64_t etime, bool bSecEnd = false);
 
 	uint64_t	replayHftDatasByDay(uint32_t curTDate);
 
 	void		simTickWithUnsubBars(uint64_t stime, uint64_t etime, uint32_t endTDate = 0, int pxType = 0);
 
 	void		simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate = 0, int pxType = 0);
+
+	//开启tick回放时按代码判断这根K线要不要用K线模拟tick
+	bool		needSimTick(BarsList* barsList);
 
 	inline bool		checkTicks(const char* stdCode, uint32_t uDate);
 
@@ -367,8 +381,6 @@ private:
 	void		scheduleTick(uint32_t idx, uint64_t stime);
 	void		collectDueTicks(uint64_t nextTime);
 	void		invalidateTickCtxs();
-	//本次事件里(逐笔委托/逐笔成交回调中)新订阅、还没有上下文的代码，按原来遍历订阅表的逻辑回放
-	void		replayNewSubTicks(std::size_t fromPos, std::size_t toPos, uint64_t nextTime, bool bCursorFirst, uint64_t& total, bool& bReplayed);
 
 	inline	uint64_t	getNextOrdQueTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
 	inline	uint64_t	getNextOrdDtlTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
@@ -511,6 +523,9 @@ private:
 	uint32_t		_tick_ctx_tdate;	//上下文对应的交易日
 	uint64_t		_tick_sub_ver;		//订阅的代码每变化一次加1
 	uint64_t		_tick_ctx_ver;		//上下文对应的订阅版本
+	wt_hashmap<std::string, uint32_t>	_tick_ctx_idx;	//代码到上下文序号
+	uint64_t		_tick_build_seq;	//上下文每重建一次加1
+	uint64_t		_bar_seq;			//K线回放时每回放一根K线的tick加1
 	OrdDtlCache		_orddtl_cache;	//order detail缓存
 	OrdQueCache		_ordque_cache;	//order queue缓存
 	TransCache		_trans_cache;	//transaction缓存
