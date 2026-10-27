@@ -219,6 +219,15 @@ private:
 
 		uint32_t		_untouch_days;	//未用到的天数
 
+		/*
+		 *	simTicks用的缓存，避免每笔模拟tick都按代码查_ticker_keys、_day_cache和_price_map
+		 *	_sim_ver和HisDataReplayer::_sim_ver不一致时重新取，那几个表有变化时版本号会加1
+		 */
+		uint64_t		_sim_ver;
+		bool			_is_ticker;		//是不是这个代码用来模拟tick的K线
+		WTSTickStruct*	_day_tick;		//_day_cache里这个代码的tick，第一次模拟时才取
+		double*			_last_price;	//_price_map里这个代码的价格，第一次模拟时才取
+
 		//这根K线对应的tick订阅上下文的序号，-1表示没有订阅tick，_tick_ctx_seq和上下文的重建序号不一致时重新取
 		uint64_t		_tick_ctx_seq;
 		int32_t			_tick_ctx_pos;
@@ -234,6 +243,7 @@ private:
 		}
 
 		_BarsList() :_cursor(UINT_MAX), _count(0), _times(1), _factor(1), _untouch_days(0)
+			, _sim_ver(0), _is_ticker(false), _day_tick(NULL), _last_price(NULL)
 			, _tick_ctx_seq(0), _tick_ctx_pos(-1){}
 	} BarsList;
 
@@ -381,6 +391,8 @@ private:
 	void		scheduleTick(uint32_t idx, uint64_t stime);
 	void		collectDueTicks(uint64_t nextTime);
 	void		invalidateTickCtxs();
+	//多线程读取订阅代码当天的tick文件(csv模式)，读文件和解压并行做，装入缓存在主线程里做
+	void		prefetchTicks(uint32_t uDate);
 
 	inline	uint64_t	getNextOrdQueTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
 	inline	uint64_t	getNextOrdDtlTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
@@ -550,6 +562,8 @@ private:
 	 *	默认为false，主要是针对涨跌停的行情，也适用于不活跃的合约
 	 */
 	bool			_nosim_if_notrade;
+	//读取tick文件的线程数，0为按CPU核数自动设置，1为不用多线程
+	uint32_t		_tick_load_threads;
 	std::map<std::string, WTSTickStruct>	_day_cache;	//每日Tick缓存,当tick回放未开放时,会用到该缓存
 	std::map<std::string, std::string>		_ticker_keys;
 
@@ -601,8 +615,11 @@ private:
 
 	//////////////////////////////////////////////////////////////////////////
 	//
-	typedef wt_hashmap<std::string, double> PriceMap;
+	//用std::unordered_map，插入新元素不会让已有元素的引用失效，K线缓存里保存了价格的指针
+	typedef std::unordered_map<std::string, double> PriceMap;
 	PriceMap		_price_map;
+	//_ticker_keys、_day_cache、_price_map有变化时加1，K线缓存里simTicks用的指针要重新取
+	uint64_t		_sim_ver;
 
 	//////////////////////////////////////////////////////////////////////////
 	//

@@ -14,6 +14,8 @@
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <atomic>
+#include <thread>
 
 #include "../Includes/WTSVariant.hpp"
 #include "../Includes/WTSDataDef.hpp"
@@ -162,6 +164,8 @@ HisDataReplayer::HisDataReplayer()
 	, _tick_ctx_tdate(0)
 	, _tick_sub_ver(1)
 	, _tick_ctx_ver(0)
+	, _sim_ver(1)
+	, _tick_load_threads(0)
 	, _tick_build_seq(1)
 	, _bar_seq(0)
 {
@@ -231,6 +235,10 @@ bool HisDataReplayer::init(WTSVariant* cfg, EventNotifier* notifier /* = NULL */
 
 	_nosim_if_notrade = cfg->getBoolean("dont_simtick_if_notrade");
 	WTSLogger::info("nosim_if_notrade is {}", _nosim_if_notrade);
+
+	//读取tick文件的线程数，不配置就是0，按CPU核数自动设置；配成1就不用多线程
+	_tick_load_threads = cfg->getUInt32("tick_load_threads");
+	WTSLogger::info("Threads for loading tick files: {}", _tick_load_threads == 0 ? std::string("auto") : std::to_string(_tick_load_threads));
 
 	//基础数据文件
 	WTSVariant* cfgBF = cfg->get("basefiles");
@@ -459,6 +467,8 @@ void HisDataReplayer::clear_cache()
 	_ticker_keys.clear();
 
 	_price_map.clear();
+	//_day_cache、_ticker_keys、_price_map都清空了，K线缓存里的指针要重新取
+	_sim_ver++;
 
 	//tick缓存清空以后上下文里的数据指针都失效了
 	invalidateTickCtxs();
@@ -518,6 +528,8 @@ void HisDataReplayer::reset()
 	invalidateTickCtxs();
 
 	_price_map.clear();
+	//_day_cache、_ticker_keys、_price_map都清空了，K线缓存里的指针要重新取
+	_sim_ver++;
 
 	_main_key = "";
 	_main_period = "";
@@ -856,6 +868,7 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 						_listener->handle_session_end(_cur_tdate);
 						_closed_tdate = _cur_tdate;
 						_day_cache.clear();
+						_sim_ver++;
 					}
 
 					/*
@@ -939,6 +952,7 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 				_listener->handle_session_end(_cur_tdate);
 				_closed_tdate = _cur_tdate;
 				_day_cache.clear();
+				_sim_ver++;
 			}
 
 			notify_state(barsList->_code.c_str(), barsList->_period, barsList->_times, _begin_time, _end_time, replayed_barcnt*100.0 / total_barcnt);
@@ -1329,11 +1343,26 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 					uint64_t barTime = 199000000000 + nextBar.time;
 					if (barTime == nowTime && bCanSim)
 					{
-						const std::string& ticker = _ticker_keys[barsList->_code];
-						if (ticker == it->first)
+						//是不是用来模拟tick的K线，按版本号缓存在K线里，不用每笔都查_ticker_keys
+						if (barsList->_sim_ver != _sim_ver)
 						{
+							auto tit = _ticker_keys.find(barsList->_code);
+							barsList->_is_ticker = (tit != _ticker_keys.end() && tit->second == it->first);
+							barsList->_day_tick = NULL;
+							barsList->_last_price = NULL;
+							barsList->_sim_ver = _sim_ver;
+						}
+
+						if (barsList->_is_ticker)
+						{
+							//_day_cache和_price_map里的元素第一次模拟时才创建，和原来的时机一样
+							if (barsList->_day_tick == NULL)
+								barsList->_day_tick = &_day_cache[barsList->_code];
+							if (barsList->_last_price == NULL)
+								barsList->_last_price = &_price_map[barsList->_code];
+
 							//开高低收
-							WTSTickStruct& curTS = _day_cache[barsList->_code];
+							WTSTickStruct& curTS = *barsList->_day_tick;
 							strcpy(curTS.code, barsList->_code.c_str());
 							curTS.action_date = _cur_date;
 							//秒数一般是0，只有小节最后一根K线里回放过最后一分钟的tick时才不是0，保证时间不往回退
@@ -1362,7 +1391,7 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 							else
 								curTS.low = min(curTS.price, curTS.low);
 
-							update_price(barsList->_code.c_str(), curTS.price);
+							*barsList->_last_price = curTS.price;
 							//这一笔是用K线模拟的tick
 							_tick_simulated = true;
 							WTSTickData* curTick = WTSTickData::create(curTS);
@@ -1655,6 +1684,9 @@ void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
 	_tick_dirty.clear();
 	_tick_due.clear();
 	_tick_ctx_idx.clear();
+
+	//当天还没加载的tick文件先并行读进来，下面的checkTicks就不用再逐个读了
+	prefetchTicks(curTDate);
 
 	//顺序和订阅表的遍历顺序一致，同一时间有多个订阅要回放时按这个顺序回放，和原来逐个遍历订阅表的顺序相同
 	_tick_ctxs.reserve(_tick_sub_map.size());
@@ -2394,8 +2426,12 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 	//if(!_tick_enabled)
 	//不做判断,主要为了防止没有tick数据,而采用第二方案
 	{
+		//模拟tick用的K线变了，K线缓存里的标记要重新取
 		if(_ticker_keys.find(stdCode) == _ticker_keys.end())
+		{
 			_ticker_keys[stdCode] = key;
+			_sim_ver++;
+		}
 		else
 		{
 			std::string oldKey = _ticker_keys[stdCode];
@@ -2404,11 +2440,13 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 			{
 				_ticker_keys[stdCode] = key;
 				_min_period = period;
+				_sim_ver++;
 			}
 			else if (oldKey.at(0) == period[0] && times < strtoul(oldKey.substr(2).c_str(), NULL, 10))
 			{
 				_ticker_keys[stdCode] = key;
 				_min_period = period;
+				_sim_ver++;
 			}
 		}
 
@@ -2930,8 +2968,186 @@ WTSTransSlice* HisDataReplayer::get_transaction_slice(const char* stdCode, uint3
 	return ticks;
 }
 
+/*
+ *	读一个tick文件，直接解压(或者读)到数据列表已有的存储里
+ *	列表的存储每天复用，不用每个文件都重新分配两块大内存，多线程读的时候也不会都卡在分配内存和缺页上
+ *	只处理新版结构体的文件，老版本结构体、大小对不上之类的情况返回false，交给原来的流程处理
+ */
+static bool load_tick_file_into(const std::string& filename, std::vector<WTSTickStruct>& items)
+{
+	FILE* f = fopen(filename.c_str(), "rb");
+	if (f == NULL)
+		return false;
+
+	bool bSucc = false;
+	do
+	{
+		BlockHeaderV2 header;
+		if (fread(&header, 1, sizeof(BlockHeader), f) != sizeof(BlockHeader))
+			break;
+
+		if (memcmp(header._blk_flag, BLK_FLAG, FLAG_SIZE) != 0)
+			break;
+
+		if (fseek(f, 0, SEEK_END) != 0)
+			break;
+		long fileSize = ftell(f);
+		if (fileSize < (long)sizeof(HisTickBlockV2))
+			break;
+
+		if (header._version == BLOCK_VERSION_RAW_V2)
+		{
+			//不压缩的新版结构体，文件头后面直接就是数据
+			std::size_t dataSize = (std::size_t)fileSize - sizeof(BlockHeader);
+			if (dataSize % sizeof(WTSTickStruct) != 0)
+				break;
+
+			items.resize(dataSize / sizeof(WTSTickStruct));
+			if (fseek(f, (long)sizeof(BlockHeader), SEEK_SET) != 0)
+				break;
+			if (dataSize > 0 && fread(items.data(), 1, dataSize, f) != dataSize)
+				break;
+
+			bSucc = true;
+		}
+		else if (header._version == BLOCK_VERSION_CMP_V2)
+		{
+			//压缩的新版结构体，读出压缩数据以后直接解压到列表的存储里
+			if (fseek(f, (long)sizeof(BlockHeader), SEEK_SET) != 0)
+				break;
+			if (fread(&header._size, 1, sizeof(header._size), f) != sizeof(header._size))
+				break;
+			if ((std::size_t)fileSize != sizeof(BlockHeaderV2) + header._size)
+				break;
+
+			std::string cmpData;
+			cmpData.resize((std::size_t)header._size);
+			if (fread((void*)cmpData.data(), 1, cmpData.size(), f) != cmpData.size())
+				break;
+
+			unsigned long long rawSize = ZSTD_getFrameContentSize(cmpData.data(), cmpData.size());
+			if (rawSize == ZSTD_CONTENTSIZE_ERROR || rawSize == ZSTD_CONTENTSIZE_UNKNOWN || rawSize % sizeof(WTSTickStruct) != 0)
+				break;
+
+			items.resize((std::size_t)(rawSize / sizeof(WTSTickStruct)));
+			if (rawSize > 0)
+			{
+				std::size_t dSize = ZSTD_decompress((void*)items.data(), (std::size_t)rawSize, cmpData.data(), cmpData.size());
+				if (ZSTD_isError(dSize) || dSize != rawSize)
+					break;
+			}
+
+			bSucc = true;
+		}
+	} while (false);
+
+	fclose(f);
+	return bSucc;
+}
+
+void HisDataReplayer::prefetchTicks(uint32_t uDate)
+{
+	//外部加载器和bin模式的读取器不保证线程安全，只在csv模式下并行读取bin/ticks下的dsb文件
+	if (_bt_loader != NULL || _mode != "csv" || _tick_load_threads == 1)
+		return;
+
+	typedef struct _TickLoadJob
+	{
+		std::string					_code;
+		std::string					_file;
+		HftDataList<WTSTickStruct>*	_list;
+		bool						_ok;
+	} TickLoadJob;
+
+	//只读当天还没有加载的代码，文件不存在的交给checkTicks按原来的流程处理
+	std::vector<TickLoadJob> jobs;
+	for (auto& v : _tick_sub_map)
+	{
+		const std::string& stdCode = v.first;
+		if (stdCode.empty())
+			continue;
+
+		auto it = _ticks_cache.find(stdCode);
+		if (it != _ticks_cache.end() && it->second._date == uDate)
+			continue;
+
+		std::string filename = fmt::format("{}bin/ticks/{}_tick_{}.dsb", _base_dir, stdCode, uDate);
+		if (!StdFile::exists(filename.c_str()))
+			continue;
+
+		TickLoadJob job;
+		job._code = stdCode;
+		job._file = filename;
+		job._list = NULL;
+		job._ok = false;
+		jobs.emplace_back(std::move(job));
+	}
+
+	//只有一个文件就没必要开线程
+	if (jobs.size() < 2)
+		return;
+
+	/*
+	 *	列表在主线程里先取好，各线程只写自己那个列表的存储
+	 *	_ticks_cache是std::unordered_map，取到的引用不会因为插入新元素失效
+	 *	新建的列表日期是0，读取失败时checkTicks会按日期不一致重新走原来的流程
+	 */
+	for (TickLoadJob& job : jobs)
+		job._list = &_ticks_cache[job._code];
+
+	uint32_t thrdCnt = (_tick_load_threads == 0) ? std::thread::hardware_concurrency() : _tick_load_threads;
+	thrdCnt = (std::max)(1u, (std::min)(thrdCnt, (uint32_t)jobs.size()));
+
+	std::atomic<std::size_t> nextJob(0);
+	auto worker = [&jobs, &nextJob]() {
+		for (;;)
+		{
+			std::size_t idx = nextJob++;
+			if (idx >= jobs.size())
+				break;
+
+			TickLoadJob& job = jobs[idx];
+			try
+			{
+				job._ok = load_tick_file_into(job._file, job._list->_items);
+			}
+			catch (...)
+			{
+				job._ok = false;
+			}
+		}
+	};
+
+	std::vector<std::thread> threads;
+	for (uint32_t i = 1; i < thrdCnt; i++)
+		threads.emplace_back(worker);
+	worker();
+	for (std::thread& t : threads)
+		t.join();
+
+	//按订阅表的顺序在主线程里设置列表的状态，和cacheRawTicksFromCSV的结果一样
+	for (TickLoadJob& job : jobs)
+	{
+		HftDataList<WTSTickStruct>& ticksList = *job._list;
+		if (!job._ok)
+		{
+			//读取失败的不改日期，checkTicks会清掉数据重新按原来的流程读
+			continue;
+		}
+
+		WTSLogger::info("Reading data from {}...", job._file);
+		WTSLogger::info("Processing file content of {}...", job._file);
+		ticksList._cursor = UINT_MAX;
+		ticksList._code = job._code;
+		ticksList._date = uDate;
+		ticksList._count = ticksList._items.size();
+	}
+}
+
 bool HisDataReplayer::checkAllTicks(uint32_t uDate)
 {
+	prefetchTicks(uDate);
+
 	bool bHasTick = false;
 	for (auto& v : _tick_sub_map)
 	{
