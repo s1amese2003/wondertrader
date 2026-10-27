@@ -53,6 +53,14 @@ ENDIF()
 
 SET(CMAKE_CXX_STANDARD 17)
 
+#CTest测试，具体的测试用例在TestUnits里注册
+ENABLE_TESTING()
+#CMake Tools用ctest -T test跑测试，没有DartConfiguration.tcl时每次都会报Cannot find file
+#不用include(CTest)，免得多出一堆Dashboard相关的目标，这里只写一个最简单的配置
+FILE(WRITE ${CMAKE_BINARY_DIR}/DartConfiguration.tcl "SourceDirectory: ${CMAKE_SOURCE_DIR}\nBuildDirectory: ${CMAKE_BINARY_DIR}\n")
+#ctest -T test默认只保留通过的测试的前1024字节输出，回放性能测试的指标会被截掉，这里放宽到64KB
+FILE(WRITE ${CMAKE_BINARY_DIR}/CTestCustom.cmake "SET(CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE 65536)\n")
+
 #basic libraries
 ADD_SUBDIRECTORY(WTSUtils)
 ADD_SUBDIRECTORY(WTSTools)
