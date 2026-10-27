@@ -12,6 +12,8 @@
 #include "WtHelper.h"
 
 #include <fstream>
+#include <algorithm>
+#include <functional>
 
 #include "../Includes/WTSVariant.hpp"
 #include "../Includes/WTSDataDef.hpp"
@@ -157,6 +159,9 @@ HisDataReplayer::HisDataReplayer()
 	, _min_period("d")
 	, _cache_clear_days(0)
 	, _align_by_section(false)
+	, _tick_ctx_tdate(0)
+	, _tick_sub_ver(1)
+	, _tick_ctx_ver(0)
 {
 }
 
@@ -453,6 +458,9 @@ void HisDataReplayer::clear_cache()
 
 	_price_map.clear();
 
+	//tick缓存清空以后上下文里的数据指针都失效了
+	invalidateTickCtxs();
+
 	WTSLogger::log_raw(LL_WARN, "All cached data cleared");
 }
 
@@ -505,6 +513,7 @@ void HisDataReplayer::reset()
 	_ordque_sub_map.clear();
 	_orddtl_sub_map.clear();
 	_trans_sub_map.clear();
+	invalidateTickCtxs();
 
 	_price_map.clear();
 
@@ -1536,102 +1545,239 @@ void HisDataReplayer::simTickWithUnsubBars(uint64_t stime, uint64_t nowTime, uin
 
 uint64_t HisDataReplayer::getNextTickTime(uint32_t curTDate, uint64_t stime /* = UINT64_MAX */)
 {
-	uint64_t nextTime = UINT64_MAX;
+	/*
+	 *	订阅的上下文按交易日缓存，换日或者订阅的代码有变化时重建
+	 *	否则只重新计算上一次回放过的订阅，其他订阅的游标没有动，下一笔的时间也不会变
+	 *	下一笔tick的时间放在小顶堆里，取最小值不用再遍历全部订阅
+	 */
+	if (_tick_ctx_tdate != curTDate || _tick_ctx_ver != _tick_sub_ver)
+	{
+		rebuildTickCtxs(curTDate, stime);
+	}
+	else if (!_tick_dirty.empty())
+	{
+		for (uint32_t idx : _tick_dirty)
+			scheduleTick(idx, stime);
+		_tick_dirty.clear();
+	}
+
+	return _tick_heap.empty() ? UINT64_MAX : _tick_heap.front().first;
+}
+
+void HisDataReplayer::invalidateTickCtxs()
+{
+	_tick_ctxs.clear();
+	_tick_heap.clear();
+	_tick_parked.clear();
+	_tick_dirty.clear();
+	_tick_due.clear();
+	_tick_ctx_tdate = 0;
+	_tick_sub_ver++;
+}
+
+void HisDataReplayer::rebuildTickCtxs(uint32_t curTDate, uint64_t stime)
+{
+	_tick_ctxs.clear();
+	_tick_heap.clear();
+	_tick_parked.clear();
+	_tick_dirty.clear();
+	_tick_due.clear();
+
+	//顺序和订阅表的遍历顺序一致，同一时间有多个订阅要回放时按这个顺序回放，和原来逐个遍历订阅表的顺序相同
+	_tick_ctxs.reserve(_tick_sub_map.size());
 	for (auto& v : _tick_sub_map)
 	{
-		const char* stdCode = v.first.c_str();
-		if (!checkTicks(stdCode, curTDate))
-			continue;
-
-		WTSSessionInfo* sInfo = get_session_info(stdCode, true);
-
-		auto& tickList = _ticks_cache[stdCode];
-		if (tickList._cursor == UINT_MAX)
+		TickSubCtx ctx;
+		ctx._code = v.first;
+		ctx._list = NULL;
+		ctx._sinfo = NULL;
+		ctx._next = UINT64_MAX;
+		if (checkTicks(ctx._code.c_str(), curTDate))
 		{
-			if (stime == UINT64_MAX)
-			{
-				/*
-				 *	如果stime为UINT64_MAX
-				 *	则说明还没有初始化
-				 *	所以要确定第一笔是什么
-				 */
-				for(tickList._cursor = 1; ; tickList._cursor++)
-				{
-					//如果时间一直不满足，则直接跳出循环
-					if(tickList._cursor > tickList._count)
-						break;
+			ctx._sinfo = get_session_info(ctx._code.c_str(), true);
+			if (ctx._sinfo == NULL)
+				WTSLogger::error("Cannot find corresponding session of {}, its ticks will not be replayed", ctx._code);
+			else
+				ctx._list = &_ticks_cache[ctx._code];
+		}
+		_tick_ctxs.emplace_back(ctx);
+	}
 
-					uint32_t tickMin = tickList._items[tickList._cursor-1].action_time / 100000;
-					if (sInfo->isInTradingTime(tickMin))
-					{
-						break;
-					}
+	for (uint32_t idx = 0; idx < (uint32_t)_tick_ctxs.size(); idx++)
+		scheduleTick(idx, stime);
+
+	_tick_ctx_tdate = curTDate;
+	_tick_ctx_ver = _tick_sub_ver;
+}
+
+void HisDataReplayer::scheduleTick(uint32_t idx, uint64_t stime)
+{
+	TickSubCtx& ctx = _tick_ctxs[idx];
+	ctx._next = UINT64_MAX;
+	if (ctx._list == NULL)
+		return;
+
+	HftDataList<WTSTickStruct>& tickList = *ctx._list;
+	WTSSessionInfo* sInfo = ctx._sinfo;
+	if (tickList._cursor == UINT_MAX)
+	{
+		if (stime == UINT64_MAX)
+		{
+			/*
+			 *	如果stime为UINT64_MAX
+			 *	则说明还没有初始化
+			 *	所以要确定第一笔是什么
+			 */
+			for(tickList._cursor = 1; ; tickList._cursor++)
+			{
+				//如果时间一直不满足，则直接跳出循环
+				if(tickList._cursor > tickList._count)
+					break;
+
+				uint32_t tickMin = tickList._items[tickList._cursor-1].action_time / 100000;
+				if (sInfo->isInTradingTime(tickMin))
+				{
+					break;
 				}
+			}
+		}
+		else
+		{
+			uint32_t uDate = (uint32_t)(stime / 10000);
+			uint32_t uTime = (uint32_t)(stime % 10000);
+
+			WTSTickStruct curTick;
+			curTick.action_date = uDate;
+			curTick.action_time = uTime * 100000;
+
+			auto tit = std::lower_bound(tickList._items.begin(), tickList._items.end(), curTick, [](const WTSTickStruct& a, const WTSTickStruct& b) {
+				if (a.action_date != b.action_date)
+					return a.action_date < b.action_date;
+				else
+					return a.action_time < b.action_time;
+			});
+
+			std::size_t pos = tit - tickList._items.begin();
+			tickList._cursor = pos + 1;
+		}
+	}
+
+	//游标是从1开始的，等于_count时最后一笔还没有回放
+	if (tickList._cursor > tickList._count)
+		return;
+
+	uint32_t nextActionTime = tickList._items[tickList._cursor - 1].action_time;
+	//By Wesley @ 2022.03.06
+	//检查一下时间戳，如果不是交易时间的，就不回放了
+	uint32_t nextMinTime = nextActionTime / 100000;
+	/*
+	 *	By Wesley @ 2023.05.05
+	 *	这里做了一个调整，主要是针对小节中间出现的tick数据
+	 *	部分数据源可能会落地小节中间的数据，导致时间戳不在交易时间
+	 *	因此先判断时间戳是否超出收盘时间，如果超出也不回放tick了
+	 *	然后如果tick数据处于小节之间，但是不在交易时间，则指针一直步进
+	 *	这次修改主要针对Issue#104
+	 */
+	//超过收盘时间的不参与计算下一笔时间，但是别的订阅的时间推进到它之后，和原来一样还是会回放
+	if(sInfo->offsetTime(nextMinTime, false) > sInfo->getCloseTime(true))
+	{
+		const WTSTickStruct& parkedTick = tickList._items[tickList._cursor - 1];
+		ctx._next = (uint64_t)parkedTick.action_date * 1000000000 + parkedTick.action_time;
+		_tick_parked.emplace_back(idx);
+		return;
+	}
+
+	while (!sInfo->isInTradingTime(nextMinTime) && tickList._cursor < tickList._count)
+	{
+		tickList._cursor++;
+		nextActionTime = tickList._items[tickList._cursor - 1].action_time;
+		nextMinTime = nextActionTime / 100000;
+	}
+
+	//剩下的tick都不在交易时间，当天不再回放
+	if (!sInfo->isInTradingTime(nextMinTime))
+	{
+		tickList._cursor = tickList._count + 1;
+		return;
+	}
+
+	const WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
+	ctx._next = (uint64_t)nextTick.action_date * 1000000000 + nextTick.action_time;
+	_tick_heap.emplace_back(ctx._next, idx);
+	std::push_heap(_tick_heap.begin(), _tick_heap.end(), std::greater<TickHeapItem>());
+}
+
+void HisDataReplayer::collectDueTicks(uint64_t nextTime)
+{
+	_tick_due.clear();
+
+	//堆顶的时间就是最早的时间，时间相同的按序号弹出，和原来遍历订阅表的顺序一致
+	while (!_tick_heap.empty() && _tick_heap.front().first <= nextTime)
+	{
+		std::pop_heap(_tick_heap.begin(), _tick_heap.end(), std::greater<TickHeapItem>());
+		_tick_due.emplace_back(_tick_heap.back().second);
+		_tick_heap.pop_back();
+	}
+
+	//下一笔超过收盘时间的订阅，时间到了一样要回放，合并以后重新按序号排
+	if (!_tick_parked.empty())
+	{
+		bool bAdded = false;
+		for (auto it = _tick_parked.begin(); it != _tick_parked.end();)
+		{
+			if (_tick_ctxs[*it]._next <= nextTime)
+			{
+				_tick_due.emplace_back(*it);
+				it = _tick_parked.erase(it);
+				bAdded = true;
 			}
 			else
 			{
-				uint32_t uDate = (uint32_t)(stime / 10000);
-				uint32_t uTime = (uint32_t)(stime % 10000);
-
-				WTSTickStruct curTick;
-				curTick.action_date = uDate;
-				curTick.action_time = uTime * 100000;
-
-				auto tit = std::lower_bound(tickList._items.begin(), tickList._items.end(), curTick, [](const WTSTickStruct& a, const WTSTickStruct& b) {
-					if (a.action_date != b.action_date)
-						return a.action_date < b.action_date;
-					else
-						return a.action_time < b.action_time;
-				});
-
-				std::size_t idx = tit - tickList._items.begin();
-				tickList._cursor = idx + 1;
+				it++;
 			}
 		}
 
-		//游标是从1开始的，等于_count时最后一笔还没有回放
-		if (tickList._cursor > tickList._count)
-			continue;
-
-		uint32_t nextActionTime = tickList._items[tickList._cursor - 1].action_time;
-		//By Wesley @ 2022.03.06
-		//检查一下时间戳，如果不是交易时间的，就不回放了
-		uint32_t nextMinTime = nextActionTime / 100000;
-		/*
-		 *	By Wesley @ 2023.05.05
-		 *	这里做了一个调整，主要是针对小节中间出现的tick数据
-		 *	部分数据源可能会落地小节中间的数据，导致时间戳不在交易时间
-		 *	因此先判断时间戳是否超出收盘时间，如果超出也不回放tick了
-		 *	然后如果tick数据处于小节之间，但是不在交易时间，则指针一直步进
-		 *	这次修改主要针对Issue#104
-		 */
-		//超过收盘时间就跳过了
-		if(sInfo->offsetTime(nextMinTime, false) > sInfo->getCloseTime(true))
-			continue;
-
-		while (!sInfo->isInTradingTime(nextMinTime) && tickList._cursor < tickList._count)
-		{
-			tickList._cursor++;
-			nextActionTime = tickList._items[tickList._cursor - 1].action_time;
-			nextMinTime = nextActionTime / 100000;
-		}
-
-		//剩下的tick都不在交易时间，当天不再回放
-		if (!sInfo->isInTradingTime(nextMinTime))
-		{
-			tickList._cursor = tickList._count + 1;
-			continue;
-		}
-
-		const WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
-		uint64_t lastTime = (uint64_t)nextTick.action_date * 1000000000 + nextTick.action_time;
-
-		nextTime = min(lastTime, nextTime);
+		if (bAdded)
+			std::sort(_tick_due.begin(), _tick_due.end());
 	}
-
-	return nextTime;
 }
 
+void HisDataReplayer::replayNewSubTicks(std::size_t fromPos, std::size_t toPos, uint64_t nextTime, bool bCursorFirst, uint64_t& total, bool& bReplayed)
+{
+	for (std::size_t pos = fromPos; pos < toPos && pos < _tick_sub_map.size(); pos++)
+	{
+		//回调里可能又订阅了新代码，订阅表的存储会重新分配，每次都重新取
+		std::string stdCode = (_tick_sub_map.begin() + pos)->first;
+		auto it = _ticks_cache.find(stdCode);
+		if (it == _ticks_cache.end())
+			continue;
+
+		HftDataList<WTSTickStruct>& tickList = it->second;
+		if ((bCursorFirst && tickList._items.empty()) || tickList._cursor > tickList._count)
+			continue;
+
+		WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
+		uint64_t lastTime = (uint64_t)nextTick.action_date * 1000000000 + nextTick.action_time;
+		if (lastTime > nextTime)
+			continue;
+
+		if (bCursorFirst)
+			tickList._cursor++;
+
+		update_price(stdCode.c_str(), nextTick.price);
+		WTSTickData* newTick = WTSTickData::create(nextTick);
+		newTick->setCode(stdCode.c_str());
+		_listener->handle_tick(stdCode.c_str(), newTick, 0);
+		newTick->release();
+
+		if (!bCursorFirst)
+		{
+			tickList._cursor++;
+			bReplayed = true;
+		}
+		total++;
+	}
+}
 
 uint64_t HisDataReplayer::getNextTransTime(uint32_t curTDate, uint64_t stime /* = UINT64_MAX */)
 {
@@ -1854,33 +2000,42 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 		}
 
 		//3、第三步再回放tick数据
-		for (auto& v : _tick_sub_map)
+		//只回放时间到了的订阅，顺序和原来遍历订阅表的顺序一致
+		collectDueTicks(nextTime);
+		std::size_t ctxCnt = _tick_ctxs.size();
+		std::size_t subCnt = _tick_sub_map.size();
+		//按下标遍历，回调里清空缓存时_tick_due也会被清空，不会访问失效的元素
+		for (std::size_t k = 0; k < _tick_due.size(); k++)
 		{
-			//std::string stdCode = v.first;
-			const char* stdCode = v.first.c_str();
-			HftDataList<WTSTickStruct>& tickList = _ticks_cache[stdCode];
-			//By Wesley @ 2022.03.06 
-			//这里加了一个数据的判断
-			//如果数据为空，则不再进行回放
-			if(tickList._items.empty() || tickList._cursor > tickList._count)
+			uint32_t idx = _tick_due[k];
+			if (idx >= _tick_ctxs.size())
+				break;
+
+			TickSubCtx& ctx = _tick_ctxs[idx];
+			HftDataList<WTSTickStruct>& tickList = *ctx._list;
+			if(tickList._cursor > tickList._count)
 				continue;
 
+			const char* stdCode = ctx._code.c_str();
 			WTSTickStruct& nextTick = tickList._items[tickList._cursor - 1];
-			uint64_t lastTime = (uint64_t)nextTick.action_date * 1000000000 + nextTick.action_time;
-			if (lastTime <= nextTime)
-			{
-				tickList._cursor++;
+			tickList._cursor++;
 
-				update_price(stdCode, nextTick.price);
-				WTSTickData* newTick = WTSTickData::create(nextTick);
-				newTick->setCode(stdCode);
-				_listener->handle_tick(stdCode, newTick, 0);
-				newTick->release();
-				
-				total_ticks++;
-			}
+			update_price(stdCode, nextTick.price);
+			WTSTickData* newTick = WTSTickData::create(nextTick);
+			newTick->setCode(stdCode);
+			_listener->handle_tick(stdCode, newTick, 0);
+			newTick->release();
+
+			total_ticks++;
 		}
-		
+		//回放过的订阅游标变了，下一次取时间之前重新计算
+		_tick_dirty.insert(_tick_dirty.end(), _tick_due.begin(), _tick_due.end());
+		if (_tick_ctx_ver != _tick_sub_ver && subCnt > ctxCnt)
+		{
+			bool bDummy = false;
+			replayNewSubTicks(ctxCnt, subCnt, nextTime, true, total_ticks, bDummy);
+		}
+
 		//4、最后回放委托队列
 		for (auto& v : _ordque_sub_map)
 		{
@@ -1983,26 +2138,38 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 		}
 
 		//3、第三步再回放tick数据
-		for (auto& v : _tick_sub_map)
+		//只回放时间到了的订阅，顺序和原来遍历订阅表的顺序一致
+		collectDueTicks(nextTime);
+		std::size_t ctxCnt = _tick_ctxs.size();
+		std::size_t subCnt = _tick_sub_map.size();
+		for (std::size_t k = 0; k < _tick_due.size(); k++)
 		{
-			const char* stdCode = v.first.c_str();
-			auto& itemList = _ticks_cache[stdCode];
+			uint32_t idx = _tick_due[k];
+			if (idx >= _tick_ctxs.size())
+				break;
+
+			TickSubCtx& ctx = _tick_ctxs[idx];
+			HftDataList<WTSTickStruct>& itemList = *ctx._list;
 			if (itemList._cursor > itemList._count)
 				continue;
 
+			const char* stdCode = ctx._code.c_str();
 			auto& nextItem = itemList._items[itemList._cursor - 1];
-			uint64_t lastTime = (uint64_t)nextItem.action_date * 1000000000 + nextItem.action_time;
-			if (lastTime <= nextTime)
-			{
-				update_price(stdCode, nextItem.price);
-				WTSTickData* newData = WTSTickData::create(nextItem);
-				newData->setCode(stdCode);
-				_listener->handle_tick(stdCode, newData, 0);
-				newData->release();
+			update_price(stdCode, nextItem.price);
+			WTSTickData* newData = WTSTickData::create(nextItem);
+			newData->setCode(stdCode);
+			_listener->handle_tick(stdCode, newData, 0);
+			newData->release();
 
-				itemList._cursor++;
-				bReplayed = true;
-			}
+			itemList._cursor++;
+			bReplayed = true;
+		}
+		//回放过的订阅游标变了，下一次取时间之前重新计算
+		_tick_dirty.insert(_tick_dirty.end(), _tick_due.begin(), _tick_due.end());
+		if (_tick_ctx_ver != _tick_sub_ver && subCnt > ctxCnt)
+		{
+			uint64_t nDummy = 0;
+			replayNewSubTicks(ctxCnt, subCnt, nextTime, false, nDummy, bReplayed);
 		}
 
 		//4、最后回放委托队列
@@ -3109,6 +3276,9 @@ void HisDataReplayer::sub_tick(uint32_t sid, const char* stdCode)
 	}
 
 	std::string hitCode(stdCode, length);
+	//新订阅了代码，tick回放的上下文下一次推进时要重建
+	if (_tick_sub_map.find(hitCode) == _tick_sub_map.end())
+		_tick_sub_ver++;
 	SubList& sids = _tick_sub_map[hitCode];
 	sids[sid] = std::make_pair(sid, flag);
 

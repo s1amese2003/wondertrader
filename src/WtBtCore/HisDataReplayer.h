@@ -10,6 +10,8 @@
 #pragma once
 #include <string>
 #include <set>
+#include <unordered_map>
+#include <vector>
 #include "HisDataMgr.h"
 #include "../WtDataStorage/DataDefine.h"
 
@@ -173,10 +175,28 @@ private:
 		HftDataList() :_cursor(UINT_MAX), _count(0), _date(0){}
 	};
 
-	typedef wt_hashmap<std::string, HftDataList<WTSTickStruct>>		TickCache;
+	/*
+	 *	tick缓存用std::unordered_map，插入新元素不会让已有元素的引用失效
+	 *	tick回放的订阅上下文里直接保存了数据列表的指针
+	 */
+	typedef std::unordered_map<std::string, HftDataList<WTSTickStruct>>	TickCache;
 	typedef wt_hashmap<std::string, HftDataList<WTSOrdDtlStruct>>	OrdDtlCache;
 	typedef wt_hashmap<std::string, HftDataList<WTSOrdQueStruct>>	OrdQueCache;
 	typedef wt_hashmap<std::string, HftDataList<WTSTransStruct>>	TransCache;
+
+	/*
+	 *	tick回放时每个订阅的上下文，按交易日缓存
+	 *	原来每推进一笔tick都要遍历全部订阅，逐个按代码查找数据和交易时段，订阅多的时候开销很大
+	 *	现在每天只查找一次，下一笔tick的时间放在小顶堆里，每推进一次只重新计算回放过的订阅
+	 */
+	typedef struct _TickSubCtx
+	{
+		std::string					_code;
+		HftDataList<WTSTickStruct>*	_list;		//当天的tick数据，没有数据时为NULL
+		WTSSessionInfo*				_sinfo;
+		uint64_t					_next;		//下一笔要回放的tick的时间
+	} TickSubCtx;
+	typedef std::pair<uint64_t, uint32_t>	TickHeapItem;	//下一笔tick的时间，上下文的序号
 
 
 	typedef struct _BarsList
@@ -341,6 +361,15 @@ private:
 	bool		checkAllTicks(uint32_t uDate);
 
 	inline	uint64_t	getNextTickTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
+
+	//tick回放的订阅上下文
+	void		rebuildTickCtxs(uint32_t curTDate, uint64_t stime);
+	void		scheduleTick(uint32_t idx, uint64_t stime);
+	void		collectDueTicks(uint64_t nextTime);
+	void		invalidateTickCtxs();
+	//本次事件里(逐笔委托/逐笔成交回调中)新订阅、还没有上下文的代码，按原来遍历订阅表的逻辑回放
+	void		replayNewSubTicks(std::size_t fromPos, std::size_t toPos, uint64_t nextTime, bool bCursorFirst, uint64_t& total, bool& bReplayed);
+
 	inline	uint64_t	getNextOrdQueTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
 	inline	uint64_t	getNextOrdDtlTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
 	inline	uint64_t	getNextTransTime(uint32_t curTDate, uint64_t stime = UINT64_MAX);
@@ -474,6 +503,14 @@ private:
 	std::string		_stra_name;
 
 	TickCache		_ticks_cache;	//tick缓存
+	std::vector<TickSubCtx>		_tick_ctxs;		//tick订阅的上下文，顺序和订阅表的遍历顺序一致
+	std::vector<TickHeapItem>	_tick_heap;		//下一笔tick时间的小顶堆，时间相同的按序号排
+	std::vector<uint32_t>		_tick_parked;	//下一笔已经超过收盘时间的订阅，不参与计算下一笔时间
+	std::vector<uint32_t>		_tick_dirty;	//上一次回放过的订阅，下一次取时间之前要重新计算
+	std::vector<uint32_t>		_tick_due;		//本次要回放的订阅
+	uint32_t		_tick_ctx_tdate;	//上下文对应的交易日
+	uint64_t		_tick_sub_ver;		//订阅的代码每变化一次加1
+	uint64_t		_tick_ctx_ver;		//上下文对应的订阅版本
 	OrdDtlCache		_orddtl_cache;	//order detail缓存
 	OrdQueCache		_ordque_cache;	//order queue缓存
 	TransCache		_trans_cache;	//transaction缓存
