@@ -15,6 +15,7 @@
 
 #include <string>
 #include <cstdio>
+#include <cinttypes>
 #include <string.h>
 #include <vector>
 #include <map>
@@ -23,8 +24,9 @@
 #define INT64_FMT	"%I64d"
 #define UINT64_FMT	"%I64u"
 #else
-#define INT64_FMT	"%ld"
-#define UINT64_FMT	"%lu"
+//Windows下的MinGW中long只有32位，用%ld会把64位整数截断，这里用inttypes里和运行库匹配的格式
+#define INT64_FMT	"%" PRId64
+#define UINT64_FMT	"%" PRIu64
 #endif
 
 
